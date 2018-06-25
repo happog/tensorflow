@@ -96,12 +96,12 @@ void XlaBuilder::NoteError(const Status& error) {
 XlaOp XlaBuilder::NoteErrorOrReturn(
     const std::function<StatusOr<XlaOp>()>& op_creator) {
   if (!first_error_.ok()) {
-    return {};
+    return XlaOp(this);
   }
   auto op = op_creator();
   if (!op.ok()) {
     NoteError(op.status());
-    return {};
+    return XlaOp(this);
   }
   return op.ConsumeValueOrDie();
 }
@@ -1120,11 +1120,9 @@ XlaOp XlaBuilder::Or(const XlaOp& lhs, const XlaOp& rhs,
   return BinaryOp(HloOpcode::kOr, lhs, rhs, broadcast_dimensions);
 }
 
-// TODO(b/65209188): Create a dedicated lowering for Xor.
 XlaOp XlaBuilder::Xor(const XlaOp& lhs, const XlaOp& rhs,
                       tensorflow::gtl::ArraySlice<int64> broadcast_dimensions) {
-  return Or(And(Not(lhs), rhs, broadcast_dimensions),
-            And(lhs, Not(rhs), broadcast_dimensions));
+  return BinaryOp(HloOpcode::kXor, lhs, rhs, broadcast_dimensions);
 }
 
 XlaOp XlaBuilder::Not(const XlaOp& operand) {
@@ -1611,14 +1609,40 @@ XlaOp XlaBuilder::BatchNormGrad(const XlaOp& operand, const XlaOp& scale,
   });
 }
 
-XlaOp XlaBuilder::CrossReplicaSum(const XlaOp& operand) {
+XlaOp XlaBuilder::CrossReplicaSum(
+    const XlaOp& operand,
+    tensorflow::gtl::ArraySlice<int64> replica_group_ids) {
   return NoteErrorOrReturn([&]() -> StatusOr<XlaOp> {
-    HloInstructionProto instr;
+    TF_ASSIGN_OR_RETURN(const Shape& shape, GetShape(operand));
+    const Shape& scalar_shape = ShapeUtil::MakeShape(shape.element_type(), {});
+    auto b = CreateSubBuilder("sum");
+    b->Add(b->Parameter(/*parameter_number=*/0, scalar_shape, "x"),
+           b->Parameter(/*parameter_number=*/1, scalar_shape, "y"));
+    TF_ASSIGN_OR_RETURN(auto computation, b->Build());
+    return CrossReplicaSum(operand, computation, replica_group_ids,
+                           /*channel_id=*/tensorflow::gtl::nullopt);
+  });
+}
 
+XlaOp XlaBuilder::CrossReplicaSum(
+    const XlaOp& operand, const XlaComputation& computation,
+    tensorflow::gtl::ArraySlice<int64> replica_group_ids,
+    const tensorflow::gtl::optional<ChannelHandle>& channel_id) {
+  return NoteErrorOrReturn([&]() -> StatusOr<XlaOp> {
+    if (channel_id.has_value()) {
+      return Unimplemented("channel_id is not supported in AllReduce");
+    }
+
+    HloInstructionProto instr;
     TF_ASSIGN_OR_RETURN(const Shape& operand_shape, GetShape(operand));
     TF_ASSIGN_OR_RETURN(
         *instr.mutable_shape(),
         ShapeInference::InferCrossReplicaSumShape({&operand_shape}));
+    for (int64 replica_group_id : replica_group_ids) {
+      instr.add_replica_group_ids(replica_group_id);
+    }
+
+    AddCalledComputation(computation, &instr);
 
     return AddInstruction(std::move(instr), HloOpcode::kCrossReplicaSum,
                           {operand});
@@ -1964,11 +1988,6 @@ StatusOr<const HloInstructionProto*> XlaBuilder::LookUpInstruction(
     return InvalidArgument("no XlaOp value %lld", op.handle());
   }
   return &instructions_[op.handle()];
-}
-
-XlaOp XlaBuilder::UnimplementedOp() {
-  NoteError(Unimplemented("Op not implemented"));
-  return {};
 }
 
 }  // namespace xla

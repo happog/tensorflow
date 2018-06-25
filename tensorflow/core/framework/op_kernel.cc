@@ -1120,6 +1120,16 @@ void LogAllRegisteredKernels() {
   }
 }
 
+KernelList GetAllRegisteredKernels() {
+  const KernelRegistry* const typed_registry = GlobalKernelRegistryTyped();
+  KernelList kernel_list;
+  kernel_list.mutable_kernel()->Reserve(typed_registry->size());
+  for (const auto& p : *typed_registry) {
+    *kernel_list.add_kernel() = p.second.def;
+  }
+  return kernel_list;
+}
+
 string KernelsRegisteredForOp(StringPiece op_name) {
   string ret;
   for (const auto& key_registration : *GlobalKernelRegistryTyped()) {

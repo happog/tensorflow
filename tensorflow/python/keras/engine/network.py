@@ -20,6 +20,7 @@ from __future__ import division
 from __future__ import print_function
 
 import copy
+import functools
 import json
 import os
 import weakref
@@ -42,7 +43,7 @@ from tensorflow.python.keras.utils.io_utils import ask_to_proceed_with_overwrite
 from tensorflow.python.ops import variables
 from tensorflow.python.platform import tf_logging as logging
 from tensorflow.python.training.checkpointable import base as checkpointable
-from tensorflow.python.training.checkpointable import data_structures_base
+from tensorflow.python.training.checkpointable import data_structures
 from tensorflow.python.training.checkpointable import util as checkpointable_utils
 from tensorflow.python.util import nest
 from tensorflow.python.util import tf_inspect
@@ -367,7 +368,7 @@ class Network(base_layer.Layer):
     if isinstance(value, (
         base_layer.Layer,
         Network,
-        data_structures_base.CheckpointableDataStructureBase)):
+        data_structures.CheckpointableDataStructure)):
       try:
         is_graph_network = self._is_graph_network
       except AttributeError:
@@ -527,6 +528,28 @@ class Network(base_layer.Layer):
     raise ValueError('No such layer: ' + name)
 
   @property
+  def _unfiltered_updates(self):
+    if context.executing_eagerly():
+      return []
+    updates = []
+    for layer in self.layers:
+      if isinstance(layer, Network):
+        updates += layer._unfiltered_updates
+      else:
+        updates += layer.updates
+    return updates
+
+  @property
+  def _unfiltered_losses(self):
+    losses = []
+    for layer in self.layers:
+      if isinstance(layer, Network):
+        losses += layer._unfiltered_losses
+      else:
+        losses += layer.losses
+    return losses
+
+  @property
   def updates(self):
     """Retrieves the network's updates.
 
@@ -534,6 +557,8 @@ class Network(base_layer.Layer):
     unconditional, or conditional on inputs to this model
     (e.g. will not include updates that were created by layers of this model
     outside of the model).
+
+    When the network has no registered inputs, all updates are returned.
 
     Effectively, `network.updates` behaves like `layer.updates`.
 
@@ -580,22 +605,20 @@ class Network(base_layer.Layer):
     if not self.trainable and not self.stateful:
       return []
 
-    updates = []
-    for layer in self.layers:
-      updates += layer.updates
+    updates = self._unfiltered_updates
 
     # `updates` might contain irrelevant updates, so it needs to be filtered
     # with respect to inputs the model has been called on.
-    if self.inputs:
-      relevant_inputs = self.inputs[:]
-    else:
-      relevant_inputs = []
-    for i in range(1, len(self._inbound_nodes)):
+    relevant_inputs = []
+    for i in range(0, len(self._inbound_nodes)):
       inputs = self.get_input_at(i)
       if isinstance(inputs, list):
         relevant_inputs += inputs
       else:
         relevant_inputs.append(inputs)
+    if not relevant_inputs:
+      return updates
+
     reachable = tf_utils.get_reachable_from_inputs(relevant_inputs, updates)
     relevant_conditional_updates = [x for x in updates if x in reachable]
     unconditional_updates = [
@@ -614,25 +637,25 @@ class Network(base_layer.Layer):
     (e.g. will not include losses that depend on tensors
     that aren't inputs to this model).
 
+    When the network has no registered inputs, all losses are returned.
+
     Returns:
         A list of loss tensors.
     """
-    losses = []
-    for layer in self.layers:
-      losses += layer.losses
+    losses = self._unfiltered_losses
     if context.executing_eagerly():
       return losses
 
-    if self.inputs:
-      relevant_inputs = self.inputs[:]
-    else:
-      relevant_inputs = []
-    for i in range(1, len(self._inbound_nodes)):
+    relevant_inputs = []
+    for i in range(0, len(self._inbound_nodes)):
       inputs = self.get_input_at(i)
       if isinstance(inputs, list):
         relevant_inputs += inputs
       else:
         relevant_inputs.append(inputs)
+    if not relevant_inputs:
+      return losses
+
     reachable = tf_utils.get_reachable_from_inputs(relevant_inputs, losses)
     relevant_conditional_losses = [x for x in losses if x in reachable]
     unconditional_losses = [
@@ -1300,7 +1323,11 @@ class Network(base_layer.Layer):
       with h5py.File(filepath, 'w') as f:
         saving.save_weights_to_hdf5_group(f, self.layers)
     else:
-      self._checkpointable_saver.save(filepath)
+      if context.executing_eagerly():
+        session = None
+      else:
+        session = backend.get_session()
+      self._checkpointable_saver.save(filepath, session=session)
 
   def load_weights(self, filepath, by_name=False):
     """Loads all layer weights, either from a TensorFlow or an HDF5 weight file.
@@ -1360,7 +1387,8 @@ class Network(base_layer.Layer):
             'loading TensorFlow-formatted weights (got by_name=True to '
             'load_weights).')
       if not context.executing_eagerly():
-        finalizer = status.run_restore_ops
+        session = backend.get_session()
+        finalizer = functools.partial(status.run_restore_ops, session=session)
         if self.built:
           finalizer()
         else:
@@ -1457,7 +1485,8 @@ class Network(base_layer.Layer):
         ImportError: if yaml module is not found.
     """
     if yaml is None:
-      raise ImportError('Requires yaml module installed.')
+      raise ImportError(
+          'Requires yaml module installed (`pip install pyyaml`).')
     return yaml.dump(self._updated_config(), **kwargs)
 
   def summary(self, line_length=None, positions=None, print_fn=None):
@@ -1487,47 +1516,6 @@ class Network(base_layer.Layer):
                               line_length=line_length,
                               positions=positions,
                               print_fn=print_fn)
-
-
-def get_source_inputs(tensor, layer=None, node_index=None):
-  """Returns the list of input tensors necessary to compute `tensor`.
-
-  Output will always be a list of tensors
-  (potentially with 1 element).
-
-  Arguments:
-      tensor: The tensor to start from.
-      layer: Origin layer of the tensor. Will be
-          determined via tensor._keras_history if not provided.
-      node_index: Origin node index of the tensor.
-
-  Returns:
-      List of input tensors.
-  """
-  if not hasattr(tensor, '_keras_history'):
-    return tensor
-
-  if layer is None or node_index:
-    layer, node_index, _ = tensor._keras_history
-  if not layer._inbound_nodes:
-    return [tensor]
-  else:
-    node = layer._inbound_nodes[node_index]
-    if not node.inbound_layers:
-      # Reached an Input layer, stop recursion.
-      return node.input_tensors
-    else:
-      source_tensors = []
-      for i in range(len(node.inbound_layers)):
-        x = node.input_tensors[i]
-        layer = node.inbound_layers[i]
-        node_index = node.node_indices[i]
-        previous_sources = get_source_inputs(x, layer, node_index)
-        # Avoid input redundancy.
-        for x in previous_sources:
-          if x not in source_tensors:
-            source_tensors.append(x)
-      return source_tensors
 
 
 def _is_hdf5_filepath(filepath):
